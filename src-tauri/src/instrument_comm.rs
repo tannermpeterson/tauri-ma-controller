@@ -326,6 +326,8 @@ async fn instrument_io(
         .with_context(|| "Error syncing with packets")?;
 
     if let Err(_) = tx_iio_to_ic.send(buf).await {
+        // returning Ok here because a failed send indicates that the receiver was closed elsewhere
+        // and thus this should exist gracefully
         return Ok(());
     }
 

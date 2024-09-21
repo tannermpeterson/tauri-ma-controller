@@ -1,7 +1,6 @@
-use std::{error::Error, mem::size_of};
+use std::mem::size_of;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::AsyncReadExt;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
@@ -305,7 +304,7 @@ impl IncomingPacketPayloads {
 }
 
 // TODO if parsing is slow, change the with_contexts to expects and figure out how to handle the
-// panics correctly. OR figure out how to remove the try_intos for something better (Try nom?)
+// panics correctly. OR figure out how to remove the try_intos for something better (Try deku)
 #[derive(Debug)]
 pub struct StatusCodes {
     pub main_status: u8,
