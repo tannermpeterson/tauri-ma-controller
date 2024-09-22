@@ -5,6 +5,8 @@ use std::mem::size_of;
 
 const NUM_WELLS: usize = 24; // TODO move this somewhere else?
 
+// pub enum
+
 #[derive(Debug, DekuRead, PartialEq)]
 #[deku(id_type = "u8")]
 pub enum PacketTypes {
@@ -146,6 +148,7 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deku::DekuError;
 
     #[test]
     fn sanity() {
@@ -168,5 +171,15 @@ mod tests {
             .expect("failed to read packet")
             .1;
         assert_eq!(res, packet);
+    }
+
+    #[test]
+    fn parse_invalid_packet_type() {
+        let test_bytes = [
+            67, 85, 82, 73, 32, 66, 73, 79, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 250,
+        ];
+        let res = Packet::from_bytes((&test_bytes, 0)).expect_err("should fail to parse");
+        assert!(matches!(res, DekuError::Parse(_)));
+        assert!(res.to_string().contains("250"));
     }
 }
