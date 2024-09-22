@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 mod file_writer;
 mod instrument_comm;
 mod packets;
+mod packets_deku;
 use file_writer::{run_file_writer, StartRecordingMetadata};
 use instrument_comm::{run_instrument_comm, InstrumentCommand};
 

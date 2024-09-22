@@ -58,6 +58,7 @@ pub async fn run_instrument_comm(
     }
 
     while let Some(res) = js.join_next().await {
+        // TODO should check if there are any errors here
         complete_task(res);
     }
 
