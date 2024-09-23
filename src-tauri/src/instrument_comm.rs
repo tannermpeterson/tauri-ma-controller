@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use deku::{DekuContainerRead, DekuContainerWrite};
 use std::{collections::VecDeque, future, io};
 use tokio::{
     net::{
@@ -12,15 +13,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::packets::{
-    is_magic_word, parse_data_stream, IncomingPacketPayloads, OutgoingPacket,
-    OutgoingPacketPayloads, PacketTypes, ParsedMagnetometerData, MAGIC_WORD_LEN,
+    parse_data_stream, IncomingMagnetometerDataPayload, IncomingPacketPayloads,
+    IncomingStartDataStreamingPayload, OutgoingPacketPayloads, Packet, PacketType, MAGIC_WORD,
+    MAGIC_WORD_LEN, STATUS_BEACON_PACKET_TYPE,
 };
 
 #[derive(Debug, Clone)]
 pub enum InstrumentCommand {
     StartDataStream,
     StopDataStream,
-    StartRecording(Sender<ParsedMagnetometerData>),
+    StartRecording(Sender<IncomingMagnetometerDataPayload>),
 }
 
 pub async fn run_instrument_comm(
@@ -59,7 +61,7 @@ pub async fn run_instrument_comm(
 
     while let Some(res) = js.join_next().await {
         // TODO should check if there are any errors here
-        complete_task(res);
+        let res = complete_task(res);
     }
 
     base_res
@@ -109,7 +111,7 @@ impl PendingCommands {
         self.command_deadlines.push_back(cd);
     }
 
-    pub fn remove(&mut self, packet_type: PacketTypes) -> Result<()> {
+    pub fn remove(&mut self, packet_type: PacketType) -> Result<()> {
         for (idx, ref cd) in self.command_deadlines.iter().enumerate() {
             if packet_type == cd.packet_type {
                 self.command_deadlines.remove(idx);
@@ -119,7 +121,7 @@ impl PendingCommands {
         Err(anyhow!("Command not found: {:?}", packet_type))
     }
 
-    pub async fn wait_for_timeout(&self) -> PacketTypes {
+    pub async fn wait_for_timeout(&self) -> PacketType {
         if let Some(cd) = self.command_deadlines.front() {
             sleep_until(cd.deadline).await;
             return cd.packet_type;
@@ -130,12 +132,12 @@ impl PendingCommands {
 }
 
 struct CommandDeadline {
-    packet_type: PacketTypes,
+    packet_type: PacketType,
     deadline: Instant,
 }
 
 impl CommandDeadline {
-    pub fn new(packet_type: PacketTypes, dur: Duration) -> Self {
+    pub fn new(packet_type: PacketType, dur: Duration) -> Self {
         Self {
             packet_type,
             deadline: Instant::now() + dur,
@@ -148,15 +150,18 @@ async fn run_instrument_comm_internal(
     mut rx_iio_to_ic: Receiver<Vec<u8>>,
     mut rx_ui_to_ic: Receiver<InstrumentCommand>,
 ) -> Result<()> {
-    let mut tx_ic_to_fw: Option<Sender<ParsedMagnetometerData>> = None;
+    let mut tx_ic_to_fw: Option<Sender<IncomingMagnetometerDataPayload>> = None;
     let mut handshake_send_deadline =
         Instant::now() + Duration::from_secs(HANDSHAKE_SEND_PERIOD_SECS);
 
     let mut pending_commands = PendingCommands::new();
     pending_commands.add(CommandDeadline::new(
-        PacketTypes::StatusBeacon,
+        STATUS_BEACON_PACKET_TYPE,
         Duration::from_secs(STATUS_BEACON_TIMEOUT_SECS),
     ));
+
+    // TODO create an internal state object to pass into the select arms, could probably put some
+    // of this state floating around in here into that struct
 
     // wait for packet sync, IIO will send just the magic word, so just need to init the buf and
     // nothing else
@@ -199,7 +204,7 @@ async fn handle_command(
     command: InstrumentCommand,
     pending_commands: &mut PendingCommands,
     tx_ic_to_iio: &Sender<Vec<u8>>,
-    tx_ic_to_fw: &mut Option<Sender<ParsedMagnetometerData>>,
+    tx_ic_to_fw: &mut Option<Sender<IncomingMagnetometerDataPayload>>,
 ) -> Result<()> {
     let payload = match command {
         InstrumentCommand::StartDataStream => Some(OutgoingPacketPayloads::StartDataStreaming),
@@ -225,17 +230,29 @@ async fn handle_command(
 async fn handle_data_stream(
     buf: Vec<u8>,
     pending_commands: &mut PendingCommands,
-    tx_ic_to_fw: &mut Option<Sender<ParsedMagnetometerData>>,
+    tx_ic_to_fw: &mut Option<Sender<IncomingMagnetometerDataPayload>>,
 ) -> Result<Vec<u8>> {
     let res = parse_data_stream(buf)?;
     for packet in res.packets {
-        if !matches!(packet.payload, IncomingPacketPayloads::MagnetometerData(_)) {
+        let ((unread_bytes, num_unread_bytes), parsed_payload) =
+            IncomingPacketPayloads::from_bytes((&packet.payload, 0))
+                .with_context(|| format!("failed to parse payload: {:?}", packet.payload))?;
+        if num_unread_bytes > 0 {
+            bail!(
+                "{} unread bytes after parsing payload: {:?} -- {:?}",
+                num_unread_bytes,
+                parsed_payload,
+                unread_bytes
+            );
+        }
+        if !matches!(parsed_payload, IncomingPacketPayloads::MagnetometerData(_)) {
             println!("RECV: {:?}", packet);
         }
+
         // default to tracking the command. If it does not need to be tracked, the match arm will
         // set this to None
-        let mut packet_type = Some(packet.payload.packet_type());
-        match packet.payload {
+        let mut packet_type_to_track = Some(parsed_payload.packet_type());
+        match parsed_payload {
             IncomingPacketPayloads::StatusBeacon(_) => {
                 // TODO process the status codes
             }
@@ -250,45 +267,47 @@ async fn handle_data_stream(
                         *tx_ic_to_fw = None;
                     }
                 }
-                packet_type = None;
+                packet_type_to_track = None;
             }
-            IncomingPacketPayloads::Reboot => {}
-            IncomingPacketPayloads::CheckConnectionStatus => {}
+            // IncomingPacketPayloads::Reboot => {}
+            // IncomingPacketPayloads::CheckConnectionStatus => {}
             IncomingPacketPayloads::Handshake(_) => {
                 // TODO process the status codes
 
                 // for the purpose of command tracking, a handshake response also counts as a status beacon
-                packet_type = Some(PacketTypes::StatusBeacon);
+                packet_type_to_track = Some(STATUS_BEACON_PACKET_TYPE);
+            } // IncomingPacketPayloads::PlateEvent => {}
+            // IncomingPacketPayloads::GoingDormant => {}
+            // IncomingPacketPayloads::SetStimProtocol => {}
+            // IncomingPacketPayloads::StartStim => {}
+            // IncomingPacketPayloads::StopStim => {}
+            // IncomingPacketPayloads::StimStatus => {}
+            // IncomingPacketPayloads::StimImpedanceCheck => {}
+            // IncomingPacketPayloads::InitOfflineMode => {}
+            // IncomingPacketPayloads::EndOfflineMode => {}
+            // IncomingPacketPayloads::SetSamplingPeriod => {}
+            IncomingPacketPayloads::StartDataStreaming(response) => {
+                // TODO check and handle success flag and save data stream start timepoint
             }
-            IncomingPacketPayloads::PlateEvent => {}
-            IncomingPacketPayloads::GoingDormant => {}
-            IncomingPacketPayloads::SetStimProtocol => {}
-            IncomingPacketPayloads::StartStim => {}
-            IncomingPacketPayloads::StopStim => {}
-            IncomingPacketPayloads::StimStatus => {}
-            IncomingPacketPayloads::StimImpedanceCheck => {}
-            IncomingPacketPayloads::InitOfflineMode => {}
-            IncomingPacketPayloads::EndOfflineMode => {}
-            IncomingPacketPayloads::SetSamplingPeriod => {}
-            IncomingPacketPayloads::StartDataStreaming => {}
-            IncomingPacketPayloads::StopDataStreaming => {}
-            IncomingPacketPayloads::GetMetadata => {}
-            IncomingPacketPayloads::SetNickname => {}
-            IncomingPacketPayloads::BeginFirmwareUpdate => {}
-            IncomingPacketPayloads::FirmwareUpdate => {}
-            IncomingPacketPayloads::EndFirmwareUpdate => {}
-            IncomingPacketPayloads::ChannelFirmwareUpdateComplete => {}
-            IncomingPacketPayloads::MainFirmwareUpdateComplete => {}
-            IncomingPacketPayloads::BarcodeFound => {}
-            IncomingPacketPayloads::TriggerError => {}
-            IncomingPacketPayloads::GetErrorDetails => {}
-            IncomingPacketPayloads::ErrorAck => {}
-            IncomingPacketPayloads::ChecksumFailure => {}
+            IncomingPacketPayloads::StopDataStreaming(success) => {
+                // TODO check and handle success flag and clear data stream start timepoint
+            } // IncomingPacketPayloads::GetMetadata => {}
+              // IncomingPacketPayloads::SetNickname => {}
+              // IncomingPacketPayloads::BeginFirmwareUpdate => {}
+              // IncomingPacketPayloads::FirmwareUpdate => {}
+              // IncomingPacketPayloads::EndFirmwareUpdate => {}
+              // IncomingPacketPayloads::ChannelFirmwareUpdateComplete => {}
+              // IncomingPacketPayloads::MainFirmwareUpdateComplete => {}
+              // IncomingPacketPayloads::BarcodeFound => {}
+              // IncomingPacketPayloads::TriggerError => {}
+              // IncomingPacketPayloads::GetErrorDetails => {}
+              // IncomingPacketPayloads::ErrorAck => {}
+              // IncomingPacketPayloads::ChecksumFailure => {}
         }
-        if let Some(packet_type) = packet_type {
+        if let Some(packet_type) = packet_type_to_track {
             pending_commands.remove(packet_type)?;
             // status beacon deadline is not tied to a command, so it must be added back here
-            if packet_type == PacketTypes::StatusBeacon {
+            if packet_type == STATUS_BEACON_PACKET_TYPE {
                 pending_commands.add(CommandDeadline::new(
                     packet_type,
                     Duration::from_secs(STATUS_BEACON_TIMEOUT_SECS),
@@ -303,10 +322,13 @@ async fn send_packet(
     tx_ic_to_iio: &Sender<Vec<u8>>,
     payload: OutgoingPacketPayloads,
 ) -> Result<()> {
-    let packet = OutgoingPacket::new(payload)?;
+    let packet = Packet::try_from(payload)?;
+    let packet_bytes = packet
+        .to_bytes()
+        .with_context(|| "failed to write packet")?;
     println!("SEND: {:?}", packet);
     tx_ic_to_iio
-        .send(packet.to_bytes())
+        .send(packet_bytes)
         .await
         .with_context(|| "Error sending msg from IC to IIO")
 }
@@ -422,8 +444,10 @@ impl<'a> InstrumentIO<'a> {
 
     async fn sync_with_packets(&self) -> Result<Vec<u8>> {
         println!("Initiating packet sync");
-        self.write(OutgoingPacket::new(OutgoingPacketPayloads::Handshake)?.to_bytes())
-            .await?;
+        let packet_bytes = Packet::try_from(OutgoingPacketPayloads::Handshake)?
+            .to_bytes()
+            .with_context(|| "failed to write packet")?;
+        self.write(packet_bytes).await?;
 
         let mut magic_word_buf = self.read(MAGIC_WORD_LEN).await?;
 
@@ -433,7 +457,7 @@ impl<'a> InstrumentIO<'a> {
             magic_word_buf.extend(new_bytes);
         }
 
-        while !is_magic_word(magic_word_buf[..MAGIC_WORD_LEN].try_into().unwrap()) {
+        while magic_word_buf[..MAGIC_WORD_LEN] != MAGIC_WORD {
             magic_word_buf.remove(0);
             let new_byte = self.read(1).await?;
             magic_word_buf.extend(new_byte);

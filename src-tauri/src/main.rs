@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{bail, Context, Result};
-use packets::ParsedMagnetometerData;
+use packets::IncomingMagnetometerDataPayload;
 use serde::Deserialize;
 use tokio::sync::{
     mpsc::{channel, Receiver, Sender},
@@ -13,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 mod file_writer;
 mod instrument_comm;
 mod packets;
-mod packets_deku;
 use file_writer::{run_file_writer, StartRecordingMetadata};
 use instrument_comm::{run_instrument_comm, InstrumentCommand};
 
@@ -132,7 +131,7 @@ async fn connect_internal(state: tauri::State<'_, Mutex<ControllerState>>) -> Re
 
 async fn record_internal(
     state: tauri::State<'_, Mutex<ControllerState>>,
-    rx_ic_to_fw: Receiver<ParsedMagnetometerData>,
+    rx_ic_to_fw: Receiver<IncomingMagnetometerDataPayload>,
     command_info: StartRecordingCommandInfo,
 ) -> Result<()> {
     // TODO eventually might need a way to send commands from here to file writer
