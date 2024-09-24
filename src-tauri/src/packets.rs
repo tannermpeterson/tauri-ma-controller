@@ -8,7 +8,6 @@ const NUM_WELLS: usize = 24; // TODO move this somewhere else?
 
 pub type PacketType = u8;
 
-// TODO add tests to make sure that the IDs match for variants that are in both enums?
 #[cfg_attr(test, derive(Clone))]
 #[derive(Debug, DekuWrite, DekuRead, PartialEq)] // It seems that DekuRead is require to get the deku_id method
 #[deku(id_type = "PacketType")]
@@ -84,8 +83,6 @@ impl OutgoingPacketPayloads {
         self.deku_id().expect("should have id assigned")
     }
 }
-
-// TODO add a test to make sure this matches the enum
 
 pub const STATUS_BEACON_PACKET_TYPE: PacketType = 0;
 
@@ -215,7 +212,7 @@ pub const MAGIC_WORD: MagicWordBuf = *b"CURI BIO";
 const TIMESTAMP_LEN: usize = size_of::<u64>();
 const CHECKSUM_LEN: usize = size_of::<u32>();
 const MIN_PACKET_REMAINDER_SIZE: usize = TIMESTAMP_LEN + CHECKSUM_LEN; // not including packet type in this calculation since it is included in the payload vec
-const MAX_PAYLOAD_LEN: usize = 20000 - CHECKSUM_LEN;
+const MAX_PAYLOAD_LEN: usize = 20000 - CHECKSUM_LEN + 1; // add one for the packet type byte
 #[deku_derive(DekuRead, DekuWrite)]
 #[derive(PartialEq)]
 #[deku(magic = b"CURI BIO", endian = "little")]
@@ -230,12 +227,12 @@ pub struct Packet {
     // PAYLOAD
     #[deku(
         count = "(*packet_remainder_size as usize) - MIN_PACKET_REMAINDER_SIZE",
-        assert = "payload.len() <= MAX_PAYLOAD_LEN - 1"  // subtract one since payload includes the packet type bytes here// TODO test this
+        assert = "payload.len() <= MAX_PAYLOAD_LEN"
     )]
     pub payload: Vec<u8>, // packet type is included in this vec to make working with deku easier
     // CHECKSUM
-    #[deku(temp, temp_value = "0")]
     // TODO set temp_value = something that will calculate the CRC
+    #[deku(temp, temp_value = "0")]
     // TODO validate checksum when reading
     checksum: u32,
 }
@@ -300,11 +297,14 @@ impl TryFrom<IncomingPacketPayloads> for Packet {
     }
 }
 
+#[derive(Debug)]
 pub struct DataParseResult {
     pub unread_bytes: Vec<u8>,
     pub packets: Vec<Packet>,
 }
 
+// TODO should add some debug logging to see what's going on in here during a real data stream.
+// i.e. how many packets parsed, how often is the incomplete branch hit, etc.
 pub fn parse_data_stream(buf: Vec<u8>) -> Result<DataParseResult> {
     let mut packets = vec![];
 
@@ -323,29 +323,35 @@ pub fn parse_data_stream(buf: Vec<u8>) -> Result<DataParseResult> {
                 });
             }
             Err(e) => {
-                return Err(e).with_context(|| "failed_to parse data stream")?;
-                // TODO need to either enable logging from deku or handle its errors in a better way
-                // TODO implement
+                let full_data_stream_len = buf.len();
+                let current_idx = buf.len() - unparsed.len();
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to parse data stream - packet starting at byte idx {}/{}. Full data stream: {:?}",
+                        current_idx,
+                        full_data_stream_len - 1,
+                        buf
+                    )
+                });
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test_helpers {
     use super::*;
-    use deku::DekuError;
 
     const MAGIC_WORD: [u8; 8] = *b"CURI BIO";
 
-    fn prepend_magic_word(packet_bytes: Vec<u8>) -> Vec<u8> {
+    pub fn prepend_magic_word(packet_bytes: Vec<u8>) -> Vec<u8> {
         MAGIC_WORD
             .into_iter()
             .chain(packet_bytes.into_iter())
             .collect()
     }
 
-    fn get_generic_status_beacon_payload() -> IncomingPacketPayloads {
+    pub fn get_generic_status_beacon_payload() -> IncomingPacketPayloads {
         IncomingPacketPayloads::StatusBeacon(IncomingStatusBeaconPayload {
             main_status: 100,
             index_of_thread_with_error: 101,
@@ -356,13 +362,49 @@ mod tests {
         })
     }
 
-    fn get_generic_status_beacon_packet() -> Packet {
+    pub fn get_generic_status_beacon_packet() -> Packet {
         get_generic_status_beacon_payload()
             .try_into()
             .expect("failed to init packet")
     }
+}
 
-    /// Individual packet tests
+#[cfg(test)]
+mod incoming_payload_tests {
+    use super::*;
+    use test_helpers::*;
+
+    #[test]
+    fn status_beacon_packet_type() {
+        let packet_type_from_payload = get_generic_status_beacon_payload()
+            .deku_id()
+            .expect("should have deku id");
+        assert_eq!(packet_type_from_payload, STATUS_BEACON_PACKET_TYPE);
+    }
+
+    #[test]
+    fn invalid_packet_type() {
+        let test_bytes = prepend_magic_word(vec![13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 250, 0, 0, 0, 0]);
+        let (remainder, packet) =
+            Packet::from_bytes((&test_bytes, 0)).expect("packet should parse");
+        assert_eq!(remainder.1, 0);
+
+        let res = IncomingPacketPayloads::from_bytes((&packet.payload, 0))
+            .expect_err("payload shouldn't parse");
+
+        assert!(matches!(res, DekuError::Parse(_)));
+        assert!(res.to_string().contains("250"));
+    }
+}
+
+// TODO
+// #[cfg(test)]
+// mod outgoing_payload_tests {}
+
+#[cfg(test)]
+mod packet_tests {
+    use super::*;
+    use test_helpers::*;
 
     #[test]
     fn write_then_parse_status_beacon() {
@@ -390,22 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_invalid_payload_type() {
-        let test_bytes = prepend_magic_word(vec![13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 250, 0, 0, 0, 0]);
-        let (remainder, packet) =
-            Packet::from_bytes((&test_bytes, 0)).expect("packet should parse");
-        assert_eq!(remainder.1, 0);
-
-        let res = IncomingPacketPayloads::from_bytes((&packet.payload, 0))
-            .expect_err("payload shouldn't parse");
-
-        assert!(matches!(res, DekuError::Parse(_)));
-        assert!(res.to_string().contains("250"));
-    }
-
-    #[test]
-    fn packet_exceeding_max_len() {
-        let packet_remainder_size = (TIMESTAMP_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN) as u16;
+    fn read_packet_exceeding_max_len() {
+        let packet_remainder_size = (TIMESTAMP_LEN + MAX_PAYLOAD_LEN + 1 + CHECKSUM_LEN) as u16;
         let test_bytes: Vec<u8> = prepend_magic_word(
             packet_remainder_size
                 .to_le_bytes()
@@ -414,16 +442,44 @@ mod tests {
                 .chain((0..packet_remainder_size).map(|_| 0))
                 .collect(),
         );
-        // let test_bytes = prepend_magic_word(test_vec);
         let res = Packet::from_bytes((&test_bytes, 0)).expect_err("packet shouldn't parse");
         assert!(matches!(res, DekuError::Assertion(_)));
         assert!(res.to_string().contains("MAX_PAYLOAD_LEN"));
     }
 
-    // TODO test parsing invalid packet type
+    #[test]
+    fn write_packet_exceeding_max_len() {
+        let mut packet = get_generic_status_beacon_packet();
+        packet.payload = (0..MAX_PAYLOAD_LEN + 1).map(|_| 0).collect();
+        let res = packet.to_bytes().expect_err("packet shouldn't write");
+        assert!(matches!(res, DekuError::Assertion(_)));
+        assert!(res.to_string().contains("MAX_PAYLOAD_LEN"));
+    }
+
+    // TODO tests for read/write packet at max len?
 
     #[test]
-    fn parse_data_stream__handle_packet_and_unread_bytes() {
+    fn invalid_magic_word() {
+        let test_bytes: Vec<u8> = (0..MAGIC_WORD_LEN as u8).collect();
+        let res = Packet::from_bytes((&test_bytes, 0)).expect_err("shouldn't parse");
+        assert!(res.to_string().contains("magic"));
+    }
+}
+
+#[cfg(test)]
+mod parse_data_stream_tests {
+    use super::*;
+    use test_helpers::*;
+
+    #[test]
+    fn empty_input() {
+        let res = parse_data_stream(vec![]).expect("failed to parse");
+        assert!(res.unread_bytes.is_empty());
+        assert!(res.packets.is_empty());
+    }
+
+    #[test]
+    fn handle_packet_and_unread_bytes() {
         let test_packet = get_generic_status_beacon_packet();
         let test_bytes = test_packet.to_bytes().expect("failed to write packet");
         let test_bytes_len = test_bytes.len();
@@ -433,10 +489,35 @@ mod tests {
             .cycle()
             .take(test_bytes_len * 2 - 1)
             .collect();
-        let res =
-            parse_data_stream(almost_two_packets.clone()).expect("failed to parse data stream");
+        let res = parse_data_stream(almost_two_packets.clone()).expect("failed to parse");
 
         assert_eq!(res.unread_bytes, almost_two_packets[test_bytes_len..]);
         assert_eq!(res.packets, vec![test_packet]);
+    }
+
+    #[test]
+    fn fatal_parsing_error() {
+        let test_packet_bytes = get_generic_status_beacon_packet()
+            .to_bytes()
+            .expect("failed to write packet");
+        let test_packet_bytes_len = test_packet_bytes.len();
+        let test_data_stream: Vec<u8> = test_packet_bytes
+            .into_iter()
+            .cycle()
+            .take(test_packet_bytes_len * 3)
+            .enumerate()
+            .map(|(i, n)| if i != test_packet_bytes_len { n } else { 0 })
+            .collect();
+        let test_data_stream_len = test_data_stream.len();
+
+        let res = parse_data_stream(test_data_stream.clone()).expect_err("shouldn't parse");
+        let res_dbg_str = format!("{:?}", res);
+        assert!(res_dbg_str.contains("magic"));
+        assert!(res_dbg_str.contains(&format!(
+            "{}/{}",
+            test_packet_bytes_len,
+            test_data_stream_len - 1
+        )));
+        assert!(res_dbg_str.contains(&format!("{:?}", test_data_stream)));
     }
 }
