@@ -165,7 +165,7 @@ async fn run_instrument_comm_internal(
 
     // wait for packet sync, IIO will send just the magic word, so just need to init the buf and
     // nothing else
-    let mut buf = match rx_iio_to_ic.recv().await {
+    let mut raw_data_buf = match rx_iio_to_ic.recv().await {
         None => return Ok(()),
         Some(buf) => buf,
     };
@@ -176,8 +176,9 @@ async fn run_instrument_comm_internal(
                 match data {
                     None => break,
                     Some(data) => {
-                        buf.extend(data);
-                        buf = handle_data_stream(buf, &mut pending_commands, &mut tx_ic_to_fw).await.with_context(|| "error handling data stream")?;
+                        raw_data_buf.extend(data);
+                        // TODO need to buffer mag and stim data // (raw_data_buf,mag_data_buf,stim_data_buf) = handle_data_stream
+                        raw_data_buf = handle_data_stream(raw_data_buf, &mut pending_commands, &mut tx_ic_to_fw).await.with_context(|| "Error handling data stream")?;
                     },
                 }
             }
@@ -236,7 +237,7 @@ async fn handle_data_stream(
     for packet in res.packets {
         let ((unread_bytes, num_unread_bytes), parsed_payload) =
             IncomingPacketPayloads::from_bytes((&packet.payload, 0))
-                .with_context(|| format!("failed to parse payload: {:?}", packet.payload))?;
+                .with_context(|| format!("Failed to parse payload: {:?}", packet.payload))?;
         if num_unread_bytes > 0 {
             bail!(
                 "{} unread bytes after parsing payload: {:?} -- {:?}",
@@ -325,7 +326,7 @@ async fn send_packet(
     let packet = Packet::try_from(payload)?;
     let packet_bytes = packet
         .to_bytes()
-        .with_context(|| "failed to write packet")?;
+        .with_context(|| "Failed to write packet")?;
     println!("SEND: {:?}", packet);
     tx_ic_to_iio
         .send(packet_bytes)
@@ -446,7 +447,7 @@ impl<'a> InstrumentIO<'a> {
         println!("Initiating packet sync");
         let packet_bytes = Packet::try_from(OutgoingPacketPayloads::Handshake)?
             .to_bytes()
-            .with_context(|| "failed to write packet")?;
+            .with_context(|| "Failed to write packet")?;
         self.write(packet_bytes).await?;
 
         let mut magic_word_buf = self.read(MAGIC_WORD_LEN).await?;

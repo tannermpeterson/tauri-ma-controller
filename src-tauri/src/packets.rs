@@ -4,7 +4,7 @@ use deku::{
 };
 use std::{fmt, mem::size_of};
 
-const NUM_WELLS: usize = 24; // TODO move this somewhere else?
+pub const NUM_WELLS: usize = 24; // TODO move this somewhere else?
 
 pub type PacketType = u8;
 
@@ -183,19 +183,19 @@ pub struct IncomingMagnetometerDataPayload {
 
 #[cfg_attr(test, derive(Clone, DekuWrite))]
 #[derive(Debug, DekuRead, PartialEq)]
+pub struct WellData {
+    pub s1: SensorData,
+    pub s2: SensorData,
+    pub s3: SensorData,
+}
+
+#[cfg_attr(test, derive(Clone, DekuWrite))]
+#[derive(Debug, DekuRead, PartialEq)]
 pub struct SensorData {
     pub time_offset: u16,
     pub x: u16,
     pub y: u16,
     pub z: u16,
-}
-
-#[cfg_attr(test, derive(Clone, DekuWrite))]
-#[derive(Debug, DekuRead, PartialEq)]
-pub struct WellData {
-    pub s1: SensorData,
-    pub s2: SensorData,
-    pub s3: SensorData,
 }
 
 #[cfg_attr(test, derive(Clone, DekuWrite))]
